@@ -1,5 +1,5 @@
 // Copyright 2025 Matthew Pombo. All rights reserved.
-// Use of this source code is governed by an MIT-style
+// Use of this source code is governed by an Mozilla Public License, version 2.0
 // license that can be found in the LICENSE file.
 
 // Package rlog provides a buffered log writer with automatic flushing and file
