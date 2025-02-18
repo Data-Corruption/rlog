@@ -61,18 +61,61 @@ const (
 	DefaultMaxBuffAge  = 15 * time.Second  // 15 seconds
 )
 
-// Writer implements a buffered log writer with automatic file rotation.
+type noCopy struct{} // see https://github.com/golang/go/issues/8005#issuecomment-190753527
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
+// Writer implements buffered log writing with automatic file rotation.
+// If a write operation returns an error, no further data is accepted and subsequent
+// function calls will return the error.
 type Writer struct {
-	dirPath     string
-	filePath    string
+	_ noCopy
+
+	mu        *sync.Mutex // pointer to allow disabling synchronization using nil
+	err       error
+	buf       []byte
+	file      *os.File
+	dirPath   string
+	lastFlush time.Time
+
 	maxFileSize int64
 	maxBufSize  int
 	maxBufAge   time.Duration
-	lastFlush   time.Time
-	mutex       *sync.Mutex
-	file        *os.File
-	buf         []byte
 }
+
+// New creates and initializes a new Writer for the specified directory.
+// The directory must exist. Additional options can be provided to customize
+// the Writer's behavior.
+func New(dirPath string, opts ...Option) (*Writer, error) {
+	if fi, err := os.Stat(dirPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("directory %q does not exist", dirPath)
+		} else {
+			return nil, err
+		}
+	} else if !fi.IsDir() {
+		return nil, fmt.Errorf("path %q is not a directory", dirPath)
+	}
+	w := &Writer{
+		buf:         make([]byte, 0, DefaultMaxBufSize),
+		dirPath:     dirPath,
+		lastFlush:   time.Now(),
+		maxFileSize: DefaultMaxFileSize,
+		maxBufSize:  DefaultMaxBufSize,
+		maxBufAge:   DefaultMaxBuffAge,
+	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	var err error
+	if w.file, err = os.OpenFile(filepath.Join(w.dirPath, "latest.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+// options
 
 // Option defines a function that configures a Writer.
 type Option func(*Writer)
@@ -96,7 +139,8 @@ func WithMaxBufSize(size int) Option {
 	}
 }
 
-// WithMaxBufAge sets the age of the buffer. On Write(), if the buffer is older than maxBufAge, it will be flushed.
+// WithMaxBufAge sets the age of the buffer. On Write(), if the buffer is older
+// than maxBufAge, it will be flushed.
 func WithMaxBufAge(d time.Duration) Option {
 	return func(w *Writer) {
 		w.maxBufAge = d
@@ -107,40 +151,23 @@ func WithMaxBufAge(d time.Duration) Option {
 // internal synchronization via a mutex.
 func WithSync() Option {
 	return func(w *Writer) {
-		w.mutex = &sync.Mutex{}
+		w.mu = &sync.Mutex{}
 	}
 }
 
-// New creates and initializes a new Writer for the specified directory.
-// The directory must exist. Additional options can be provided to customize
-// the Writer's behavior.
-func New(dirPath string, opts ...Option) (*Writer, error) {
-	if fi, err := os.Stat(dirPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("directory %q does not exist", dirPath)
-		} else {
-			return nil, err
-		}
-	} else if !fi.IsDir() {
-		return nil, fmt.Errorf("path %q is not a directory", dirPath)
+// methods
+
+// Flush writes any buffered data to disk. Flushing happens automatically during Write()
+// when the buffer exceeds maxBufSize or maxBufAge. Manually flushing is usually unnecessary.
+func (w *Writer) Flush() error {
+	if w.mu != nil {
+		w.mu.Lock()
+		defer w.mu.Unlock()
 	}
-	w := &Writer{
-		dirPath:     dirPath,
-		maxFileSize: DefaultMaxFileSize,
-		maxBufSize:  DefaultMaxBufSize,
-		maxBufAge:   DefaultMaxBuffAge,
-		lastFlush:   time.Now(),
-		buf:         make([]byte, 0, DefaultMaxBufSize),
+	if w.err != nil {
+		return w.err
 	}
-	for _, opt := range opts {
-		opt(w)
-	}
-	w.filePath = filepath.Join(w.dirPath, "latest.log")
-	var err error
-	if w.file, err = os.OpenFile(w.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
-		return nil, err
-	}
-	return w, nil
+	return w.flush()
 }
 
 // Write appends the contents of p to the Writer's buffer.
@@ -150,9 +177,12 @@ func New(dirPath string, opts ...Option) (*Writer, error) {
 // Write implements the io.Writer interface and returns the length of p on success.
 // Partial writes are not supported.
 func (w *Writer) Write(p []byte) (int, error) {
-	if w.mutex != nil {
-		w.mutex.Lock()
-		defer w.mutex.Unlock()
+	if w.mu != nil {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+	}
+	if w.err != nil {
+		return 0, w.err
 	}
 	w.buf = append(w.buf, p...)
 	if len(w.buf) >= w.maxBufSize || time.Since(w.lastFlush) >= w.maxBufAge {
@@ -163,21 +193,15 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Flush manually flushes the log write buffer.
-func (w *Writer) Flush() error {
-	if w.mutex != nil {
-		w.mutex.Lock()
-		defer w.mutex.Unlock()
-	}
-	return w.flush()
-}
-
 // Close flushes any remaining buffered data to disk and closes the underlying file.
 // It should be called when the Writer is no longer needed.
 func (w *Writer) Close() error {
-	if w.mutex != nil {
-		w.mutex.Lock()
-		defer w.mutex.Unlock()
+	if w.mu != nil {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+	}
+	if w.err != nil {
+		return w.err
 	}
 	if err := w.flush(); err != nil {
 		return err
@@ -194,8 +218,12 @@ func (w *Writer) Close() error {
 //
 // flush returns an error if the write, file sync, or rotation fails.
 func (w *Writer) flush() error {
+	if w.err != nil {
+		return w.err
+	}
 	if w.file == nil {
-		return fmt.Errorf("log file %q is closed", w.filePath)
+		w.err = fmt.Errorf("log file %q is closed", filepath.Join(w.dirPath, "latest.log"))
+		return w.err
 	}
 	if len(w.buf) == 0 {
 		return nil
@@ -203,7 +231,8 @@ func (w *Writer) flush() error {
 	// Determine if the file needs to be rotated.
 	fi, err := w.file.Stat()
 	if err != nil {
-		return err
+		w.err = fmt.Errorf("failed to stat log file: %v", err)
+		return w.err
 	}
 	if fi.Size()+int64(len(w.buf)) >= w.maxFileSize {
 		if err := w.rotate(); err != nil {
@@ -212,10 +241,12 @@ func (w *Writer) flush() error {
 	}
 	// Write the buffer to the file and sync.
 	if _, err := w.file.Write(w.buf); err != nil {
-		return err
+		w.err = fmt.Errorf("failed to write to log file: %v", err)
+		return w.err
 	}
 	if err := w.file.Sync(); err != nil {
-		return err
+		w.err = fmt.Errorf("failed to sync log file: %v", err)
+		return w.err
 	}
 	w.buf = w.buf[:0]
 	w.lastFlush = time.Now()
@@ -226,19 +257,24 @@ func (w *Writer) flush() error {
 // "latest.log" file for subsequent writes. The timestamp includes sub-second
 // precision to avoid naming collisions in high-frequency rotation scenarios.
 func (w *Writer) rotate() error {
+	if w.err != nil {
+		return w.err
+	}
 	if w.file != nil {
 		if err := w.file.Close(); err != nil {
-			return err
+			w.err = fmt.Errorf("failed to close log file: %v", err)
+			return w.err
 		}
 		w.file = nil
 	}
+	oldPath := filepath.Join(w.dirPath, "latest.log")
 	ts := time.Now().Format("20060102-150405.000000")
 	newPath := filepath.Join(w.dirPath, fmt.Sprintf("%s.log", ts))
-	if err := os.Rename(w.filePath, newPath); err != nil {
+	if err := os.Rename(oldPath, newPath); err != nil {
 		return err
 	}
 	var err error
-	if w.file, err = os.OpenFile(w.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+	if w.file, err = os.OpenFile(oldPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
 		return err
 	}
 	return nil
