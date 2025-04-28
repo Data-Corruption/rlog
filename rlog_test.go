@@ -25,7 +25,14 @@ func TestWriteFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create Writer: %v", err)
 	}
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Logf("failed to close Writer: %v", err)
+		}
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Fatalf("failed to remove temp directory: %v", err)
+		}
+	}()
 
 	message := "Hello, test log!\n"
 	n, err := w.Write([]byte(message))
@@ -57,7 +64,14 @@ func TestRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create Writer: %v", err)
 	}
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Logf("failed to close Writer: %v", err)
+		}
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Fatalf("failed to remove temp directory: %v", err)
+		}
+	}()
 
 	// Write an initial message.
 	initial := "abc" // 3 bytes
@@ -122,7 +136,14 @@ func TestConcurrentWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create Writer: %v", err)
 	}
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Logf("failed to close Writer: %v", err)
+		}
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Fatalf("failed to remove temp directory: %v", err)
+		}
+	}()
 
 	var wg sync.WaitGroup
 	numGoroutines := 5

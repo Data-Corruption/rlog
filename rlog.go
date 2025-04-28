@@ -13,6 +13,10 @@
 // exceeds a maximum size. Rotation, renames the latest log file ("latest.log")
 // to a timestamp (with sub-second resolution) and a new "latest.log" is created.
 //
+// Note the Writer will not automatically flush when the buffer age exceeds the
+// maximum buffer age. If you want that functionality, you should create a
+// separate goroutine that calls Flush() periodically.
+//
 // Note that by default Writer is not safe for concurrent use. Use the WithSync
 // option to enable internal synchronization.
 //
@@ -58,7 +62,7 @@ import (
 const (
 	DefaultMaxFileSize = 256 * 1024 * 1024 // 256 MB
 	DefaultMaxBufSize  = 4096              // 4 KB
-	DefaultMaxBuffAge  = 15 * time.Second  // 15 seconds
+	DefaultMaxBufAge   = 15 * time.Second  // 15 seconds
 )
 
 type noCopy struct{} // see https://github.com/golang/go/issues/8005#issuecomment-190753527
@@ -70,7 +74,7 @@ func (*noCopy) Unlock() {}
 // If a write operation returns an error, no further data is accepted and subsequent
 // function calls will return the error.
 type Writer struct {
-	_ noCopy
+	noCopy noCopy
 
 	mu        *sync.Mutex // pointer to allow disabling synchronization using nil
 	err       error
@@ -103,13 +107,13 @@ func New(dirPath string, opts ...Option) (*Writer, error) {
 		lastFlush:   time.Now(),
 		maxFileSize: DefaultMaxFileSize,
 		maxBufSize:  DefaultMaxBufSize,
-		maxBufAge:   DefaultMaxBuffAge,
+		maxBufAge:   DefaultMaxBufAge,
 	}
 	for _, opt := range opts {
 		opt(w)
 	}
 	var err error
-	if w.file, err = os.OpenFile(filepath.Join(w.dirPath, "latest.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+	if w.file, err = os.OpenFile(filepath.Join(w.dirPath, "latest.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err != nil {
 		return nil, err
 	}
 	return w, nil
@@ -193,6 +197,12 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// WriteString is a convenience method that wraps Write() for string data.
+func (w *Writer) WriteString(s string) (int, error) {
+	bytes := []byte(s)
+	return w.Write(bytes)
+}
+
 // Close flushes any remaining buffered data to disk and closes the underlying file.
 // It should be called when the Writer is no longer needed.
 func (w *Writer) Close() error {
@@ -209,7 +219,7 @@ func (w *Writer) Close() error {
 	return w.file.Close()
 }
 
-// ==== Internal methods ======================================================
+// internal methods
 
 // flush writes the contents of the buffer to the latest log file.
 // If writing the buffer would cause the file to exceed maxFileSize,
@@ -271,10 +281,12 @@ func (w *Writer) rotate() error {
 	ts := time.Now().Format("20060102-150405.000000")
 	newPath := filepath.Join(w.dirPath, fmt.Sprintf("%s.log", ts))
 	if err := os.Rename(oldPath, newPath); err != nil {
+		w.err = fmt.Errorf("failed to rename log file: %v", err)
 		return err
 	}
 	var err error
-	if w.file, err = os.OpenFile(oldPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+	if w.file, err = os.OpenFile(oldPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err != nil {
+		w.err = fmt.Errorf("failed to create new log file: %v", err)
 		return err
 	}
 	return nil
