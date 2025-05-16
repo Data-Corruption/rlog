@@ -318,6 +318,18 @@ func (l *Logger) SetLevel(level string) error {
 	return nil
 }
 
+func (l *Logger) Flush() error {
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+	if l.IsClosed() {
+		return ErrClosed
+	}
+	if err := l.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush rlog writer: %w", err)
+	}
+	return nil
+}
+
 func (l *Logger) Close() error {
 	l.closeMu.Lock()
 	defer l.closeMu.Unlock()
